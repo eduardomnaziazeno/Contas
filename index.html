@@ -403,6 +403,26 @@ function editIncome(i, date) {
   };
 }
 
+function editDebt(d) {
+  openForm({
+    title: d ? 'Editar dívida' : 'Nova dívida',
+    fields: [
+      { k: 'name', l: 'Nome', req: true },
+      { k: 'kind', l: 'Tipo', t: 'select', opts: Object.entries(KINDS) },
+      { k: 'creditor', l: 'Banco / credor' },
+      num('initial_balance', 'Valor em dívida quando começou a registar (€)', { req: true }),
+      num('installment_amount', 'Valor da prestação mensal (€)'),
+      num('installments_total', 'Prestações que faltavam quando começou a registar'),
+      num('due_day', 'Dia do vencimento'),
+      { k: 'source_id', l: 'Debitada de', t: 'select', opts: sourceOpts() },
+      { k: 'notes', l: 'Notas' },
+    ],
+    values: d,
+    onSave: (v) => (d ? api('PUT', 'debts/' + d.id, v) : api('POST', 'debts', v)),
+    onDelete: d && (() => api('DELETE', 'debts/' + d.id)),
+  });
+}
+
 function debtMovement(d, type) {
   openForm({
     title: (type === 'pagamento' ? 'Pagamento · ' : 'Acréscimo · ') + d.name,
@@ -626,12 +646,130 @@ function viewConfig() {
 let repSel = 'geral';
 
 function repDebts() {
-  if (repSel === 'geral') return db.debts;
+  if (repSel === 'geral' || repSel.startsWith('rep:')) return db.debts;
   if (repSel.startsWith('kind:')) return db.debts.filter((d) => d.kind === repSel.slice(5));
   const d = find(db.debts, repSel);
   if (d) return [d];
   repSel = 'geral';
   return db.debts;
+}
+
+function repOptions() {
+  const kinds = Object.keys(KINDS).filter((k) => db.debts.some((d) => d.kind === k));
+  return [
+    ['geral', 'Geral (tudo)'],
+    ['rep:entradas', 'Entradas por tipo'],
+    ['rep:contas', 'Contas a pagar por nome'],
+    ['rep:atrasos', 'Atrasos'],
+    ...kinds.map((k) => ['kind:' + k, 'Todos: ' + KINDS[k]]),
+    ...db.debts.map((d) => [String(d.id), KINDS[d.kind] + ': ' + d.name]),
+  ];
+}
+
+const repSelect = (opts) => `<label class="noprint">Relatório de<select id="repSel">${opts.map(([v, l]) => `<option value="${esc(v)}" ${v === repSel ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></label>`;
+const csvQ = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+const csvN = (v) => String(Math.round((v || 0) * 100) / 100).replace('.', ',');
+const csvOut = (lines) => '\uFEFF' + lines.map((r) => r.join(';')).join('\n');
+
+// Entradas por tipo: uma coluna por tipo, uma linha por mês.
+function incomeMatrix() {
+  const group = (i) => (i.type_id && find(db.income_types, i.type_id)?.name) || i.name || 'Sem tipo';
+  const incs = db.incomes.filter((i) => i.date);
+  const cur = monthOf(localDate());
+  const cols = [...new Set(incs.map(group))];
+  const first = incs.reduce((a, i) => (monthOf(i.date) < a ? monthOf(i.date) : a), cur);
+  const last = incs.reduce((a, i) => (monthOf(i.date) > a ? monthOf(i.date) : a), cur);
+  const months = [];
+  for (let m = first; m <= last; m = addMonths(m, 1)) months.push(m);
+  const cell = (m, c) => sum(incs.filter((i) => monthOf(i.date) === m && group(i) === c), (i) => i.amount);
+  return { cols, months: months.slice(-24), cell };
+}
+
+// Contas a pagar por nome: valores pagos nos últimos 6 meses e variação entre os dois últimos pagamentos.
+function billMatrix() {
+  const cur = monthOf(localDate());
+  const months = [5, 4, 3, 2, 1, 0].map((k) => addMonths(cur, -k));
+  const rows = db.bills
+    .map((b) => {
+      const pays = db.bill_payments.filter((p) => p.bill_id === b.id).sort((x, y) => x.month.localeCompare(y.month));
+      if (!pays.length) return null;
+      const [prev, last] = pays.slice(-2).length === 2 ? pays.slice(-2) : [null, pays[pays.length - 1]];
+      const diff = prev ? last.amount - prev.amount : null;
+      return { name: b.name, cells: months.map((m) => sum(pays.filter((p) => p.month === m), (p) => p.amount)), diff, pct: prev && prev.amount ? (diff / prev.amount) * 100 : null };
+    })
+    .filter(Boolean);
+  return { months, rows };
+}
+const varText = (r) => (r.diff === null ? '–' : `${r.diff >= 0 ? '+' : '−'}${eur(Math.abs(r.diff))}${r.pct === null ? '' : ` (${r.pct >= 0 ? '+' : '−'}${Math.abs(Math.round(r.pct))}%)`}`);
+
+// Atrasos: o que ficou por pagar depois do vencimento (mês atual e 2 anteriores).
+function lateItems() {
+  const today = localDate();
+  const cur = monthOf(today);
+  const out = [];
+  for (const k of [2, 1, 0]) {
+    const m = addMonths(cur, -k);
+    const [y, mo] = m.split('-').map(Number);
+    for (const it of monthItems(m)) {
+      if (it.ref || !it.day) continue;
+      const due = `${m}-${pad(Math.min(it.day, new Date(y, mo, 0).getDate()))}`;
+      if (due >= today) continue;
+      out.push({ ...it, m, due, days: Math.round((new Date(today) - new Date(due)) / 864e5) });
+    }
+  }
+  return out.sort((a, b) => b.days - a.days);
+}
+
+function viewRelExtra() {
+  const opts = repOptions();
+  const title = opts.find(([v]) => v === repSel)[1];
+  let body = '';
+  if (repSel === 'rep:entradas') {
+    const { cols, months, cell } = incomeMatrix();
+    const shown = [...months].reverse();
+    body = cols.length
+      ? `<div class="card tw"><table>
+        <tr><th>Mês</th>${cols.map((c) => `<th>${esc(c)}</th>`).join('')}<th>Total</th></tr>
+        ${shown.map((m) => `<tr><td>${esc(shortMonth(m))}</td>${cols.map((c) => `<td>${cell(m, c) ? eur(cell(m, c)) : '–'}</td>`).join('')}<td><b>${eur(sum(cols, (c) => cell(m, c)))}</b></td></tr>`).join('')}
+        <tfoot><tr><td>Total</td>${cols.map((c) => `<td>${eur(sum(months, (m) => cell(m, c)))}</td>`).join('')}<td>${eur(sum(months, (m) => sum(cols, (c) => cell(m, c))))}</td></tr></tfoot>
+      </table></div>`
+      : '<div class="empty">Ainda sem entradas registadas.</div>';
+  } else if (repSel === 'rep:contas') {
+    const { months, rows } = billMatrix();
+    body = rows.length
+      ? `<div class="card tw"><table>
+        <tr><th>Conta</th>${months.map((m) => `<th>${esc(shortMonth(m))}</th>`).join('')}<th>Var. último vs anterior</th></tr>
+        ${rows.map((r) => `<tr><td>${esc(r.name)}</td>${r.cells.map((v) => `<td>${v ? eur(v) : '–'}</td>`).join('')}<td class="${r.diff > 0 ? 'bad' : r.diff < 0 ? 'good' : ''}">${varText(r)}</td></tr>`).join('')}
+        <tfoot><tr><td>Total</td>${months.map((_, i) => `<td>${eur(sum(rows, (r) => r.cells[i]))}</td>`).join('')}<td></td></tr></tfoot>
+      </table></div><div class="muted">Só conta o que marcou como pago. A variação compara os dois últimos pagamentos de cada conta.</div>`
+      : '<div class="empty">Ainda sem contas pagas. Marque contas como pagas em Mês.</div>';
+  } else {
+    const late = lateItems();
+    body = late.length
+      ? `<div class="card row"><span>Total em atraso</span><b class="bad">${eur(sum(late, (l) => l.amount))}</b></div>
+        ${late.map((l) => `<div class="card row" data-act="late-pay" data-m="${l.m}" data-kind="${l.kind}" data-id="${l.id}"><span>${esc(l.name)}<div class="muted">venceu ${esc(l.due.slice(8))}/${esc(l.due.slice(5, 7))} · ${esc(sourceName(l.source_id))}</div></span><span style="text-align:right"><b>${eur(l.amount)}</b><div class="bad muted">${l.days} ${l.days === 1 ? 'dia' : 'dias'} de atraso</div></span></div>`).join('')}
+        <div class="muted">Considera o mês atual e os 2 anteriores. Toque numa linha para registar o pagamento.</div>`
+      : '<div class="empty">Nada em atraso.</div>';
+  }
+  return `<h1>Relatórios</h1>${repSelect(opts)}
+    <h2>${esc(title)} · ${esc(localDate())}</h2>
+    ${body}
+    <div class="actions noprint">
+      <button class="btn" data-act="rel-csv">Exportar CSV</button>
+      <button class="btn sec" data-act="rel-print">Imprimir / PDF</button>
+    </div>`;
+}
+
+function extraCsv() {
+  if (repSel === 'rep:entradas') {
+    const { cols, months, cell } = incomeMatrix();
+    return csvOut([['Mês', ...cols, 'Total'].map(csvQ), ...months.map((m) => [m, ...cols.map((c) => csvN(cell(m, c))), csvN(sum(cols, (c) => cell(m, c)))])]);
+  }
+  if (repSel === 'rep:contas') {
+    const { months, rows } = billMatrix();
+    return csvOut([['Conta', ...months, 'Variação', 'Variação %'].map(csvQ), ...rows.map((r) => [csvQ(r.name), ...r.cells.map(csvN), r.diff === null ? '' : csvN(r.diff), r.pct === null ? '' : csvN(r.pct)])]);
+  }
+  return csvOut([['Conta', 'Vencimento', 'Dias de atraso', 'Valor', 'Debitada de'].map(csvQ), ...lateItems().map((l) => [csvQ(l.name), l.due, l.days, csvN(l.amount), csvQ(sourceName(l.source_id))])]);
 }
 
 function reportData() {
@@ -643,15 +781,15 @@ function reportData() {
 }
 
 function viewRel() {
+  if (repSel.startsWith('rep:')) return viewRelExtra();
   const { debts, geral, rows, stats } = reportData();
-  const kindsPresent = Object.keys(KINDS).filter((k) => db.debts.some((d) => d.kind === k));
-  const opts = [['geral', 'Geral (tudo)'], ...kindsPresent.map((k) => ['kind:' + k, 'Todos: ' + KINDS[k]]), ...db.debts.map((d) => [String(d.id), KINDS[d.kind] + ': ' + d.name])];
+  const opts = repOptions();
   const title = opts.find(([v]) => v === repSel)?.[1] || 'Geral';
   const t = (n) => (n ? eur(n) : '–');
   const shown = [...rows].reverse().slice(0, 24);
   const tot = (f) => sum(rows, f);
   return `<h1>Relatórios</h1>
-    <label class="noprint">Relatório de<select id="repSel">${opts.map(([v, l]) => `<option value="${esc(v)}" ${v === repSel ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></label>
+    ${repSelect(opts)}
     <h2>${esc(title)} · ${esc(localDate())}</h2>
     <div class="card">
       <div class="row"><span>Em dívida agora</span><b class="${sum(stats, (s) => s.balance) > 0 ? 'bad' : 'good'}">${eur(sum(stats, (s) => s.balance))}</b></div>
@@ -679,6 +817,7 @@ function viewRel() {
 }
 
 function reportCsv() {
+  if (repSel.startsWith('rep:')) return extraCsv();
   const { geral, rows, stats } = reportData();
   const n = (v) => String(Math.round((v || 0) * 100) / 100).replace('.', ',');
   const q = (v) => `"${String(v).replace(/"/g, '""')}"`;
@@ -727,6 +866,7 @@ document.addEventListener('click', (e) => {
     case 'ev-del': return confirm('Excluir este movimento?') && run(() => api('DELETE', 'debt_events/' + id));
     case 'bill-new': return editBill(null, el.dataset.date);
     case 'day': return openDay(el.dataset.date);
+    case 'late-pay': month = el.dataset.m; return editPayment(item());
     case 'type-new': return editIncomeType();
     case 'type-edit': return editIncomeType(find(db.income_types, id));
     case 'bill-edit': return editBill(find(db.bills, id));
