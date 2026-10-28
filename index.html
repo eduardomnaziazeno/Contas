@@ -201,6 +201,9 @@ async function run(fn) {
 // ---------- cálculos ----------
 const sourceName = (id) => db.sources.find((s) => s.id === id)?.name || 'Sem conta';
 
+// Só considera o mês de início se vier no formato AAAA-MM (num browser sem seletor de mês é texto livre).
+const hasStart = (d) => /^\d{4}-\d{2}$/.test(d.start_month || '');
+
 function debtStats(d) {
   const ev = db.debt_events.filter((e) => e.debt_id === d.id);
   const paid = sum(ev.filter((e) => e.type === 'pagamento'), (e) => e.amount);
@@ -214,7 +217,12 @@ function debtStats(d) {
     if (balance <= 0) remaining = 0;
   }
   const paidThisMonth = ev.some((e) => e.type === 'pagamento' && e.month === monthOf(localDate()));
-  const endMonth = remaining ? addMonths(monthOf(localDate()), remaining - (paidThisMonth ? 0 : 1)) : null;
+  // Com mês de início e nº de prestações, o fim é fixo no calendário; senão, estima-se a partir de hoje.
+  const endMonth = !remaining
+    ? null
+    : hasStart(d) && d.installments_total
+      ? addMonths(d.start_month, d.installments_total - 1)
+      : addMonths(monthOf(localDate()), remaining - (paidThisMonth ? 0 : 1));
   return { ev, paid, added, owed, balance, paidCount, remaining, endMonth };
 }
 
@@ -224,6 +232,12 @@ function monthItems(m) {
     if (!(d.installment_amount > 0)) continue;
     const ref = db.debt_events.find((e) => e.debt_id === d.id && e.type === 'pagamento' && e.month === m);
     if (!ref && debtStats(d).balance <= 0) continue;
+    // Janela de cobrança: do mês da 1.ª prestação até à última (se o nº de prestações for conhecido).
+    // Um pagamento já registado nesse mês aparece sempre, mesmo fora da janela.
+    if (!ref && hasStart(d)) {
+      if (m < d.start_month) continue;
+      if (d.installments_total && m >= addMonths(d.start_month, d.installments_total)) continue;
+    }
     items.push({ kind: 'debt', id: d.id, name: 'Prestação · ' + d.name, amount: ref ? ref.amount : d.installment_amount, day: d.due_day, source_id: d.source_id, ref });
   }
   for (const b of db.bills) {
@@ -413,6 +427,7 @@ function editDebt(d) {
       num('initial_balance', 'Valor em dívida quando começou a registar (€)', { req: true }),
       num('installment_amount', 'Valor da prestação mensal (€)'),
       num('installments_total', 'Prestações que faltavam quando começou a registar'),
+      { k: 'start_month', l: 'Primeira prestação cobrada em (mês, AAAA-MM)', t: 'month' },
       num('due_day', 'Dia do vencimento'),
       { k: 'source_id', l: 'Debitada de', t: 'select', opts: sourceOpts() },
       { k: 'notes', l: 'Notas' },
