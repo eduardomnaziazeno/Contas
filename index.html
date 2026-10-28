@@ -238,7 +238,7 @@ function monthItems(m) {
       if (m < d.start_month) continue;
       if (d.installments_total && m >= addMonths(d.start_month, d.installments_total)) continue;
     }
-    items.push({ kind: 'debt', id: d.id, name: 'Prestação · ' + d.name, amount: ref ? ref.amount : d.installment_amount, day: d.due_day, source_id: d.source_id, ref });
+    items.push({ kind: 'debt', id: d.id, m, name: 'Prestação · ' + d.name, amount: ref ? ref.amount : d.installment_amount, day: d.due_day, source_id: d.source_id, ref });
   }
   for (const b of db.bills) {
     let day = b.due_day;
@@ -247,7 +247,9 @@ function monthItems(m) {
       day = Number(b.due_date.slice(8));
     }
     const ref = db.bill_payments.find((p) => p.bill_id === b.id && p.month === m);
-    items.push({ kind: 'bill', id: b.id, name: b.name, amount: ref ? ref.amount : b.amount, day, source_id: b.source_id, ref });
+    // Conta mensal ainda não iniciada neste mês: não aparece (um pagamento já registado aparece sempre).
+    if (!ref && b.recurrence !== 'avulsa' && hasStart(b) && m < b.start_month) continue;
+    items.push({ kind: 'bill', id: b.id, m, name: b.name, amount: ref ? ref.amount : b.amount, day, source_id: b.source_id, ref });
   }
   return items.sort((a, b) => (a.day || 99) - (b.day || 99));
 }
@@ -456,6 +458,8 @@ function editBill(b, date) {
       { k: 'recurrence', l: 'Frequência', t: 'select', def: date ? 'avulsa' : 'mensal', opts: [['mensal', 'Mensal'], ['avulsa', 'Avulsa (uma vez)']] },
       num('due_day', 'Se mensal: dia do mês', { def: date ? Number(date.slice(8)) : '' }),
       { k: 'due_date', l: 'Se avulsa: data', t: 'date', def: date || '' },
+      // Evita que meses anteriores ao início apareçam como "por pagar" ou "em atraso".
+      { k: 'start_month', l: 'Se mensal: cobrada a partir de (mês, AAAA-MM; vazio = todos os meses)', t: 'month', def: b ? '' : monthOf(localDate()) },
       { k: 'source_id', l: 'Debitada de', t: 'select', opts: sourceOpts() },
       { k: 'notes', l: 'Notas' },
     ],
@@ -463,10 +467,12 @@ function editBill(b, date) {
     onSave: (v) => {
       if (v.recurrence === 'mensal') {
         if (!v.due_day) throw new Error('Indique o dia do mês.');
+        if (v.start_month && !/^\d{4}-\d{2}$/.test(v.start_month)) throw new Error('O mês de início deve ser AAAA-MM, por exemplo 2026-10.');
         v.due_date = null;
       } else {
         if (!v.due_date) throw new Error('Indique a data.');
         v.due_day = null;
+        v.start_month = null;
       }
       return b ? api('PUT', 'bills/' + b.id, v) : api('POST', 'bills', v);
     },
@@ -484,12 +490,14 @@ function editPayment(it) {
   });
 }
 
+// O pagamento é registado no mês da própria conta (it.m), não no mês que está no ecrã: assim uma conta em
+// atraso de um mês anterior, paga a partir do mês atual, fica quitada no mês certo.
 const savePayment = (it, amount, date) =>
   it.kind === 'debt'
     ? it.ref
       ? api('PUT', 'debt_events/' + it.ref.id, { amount, date })
-      : api('POST', 'debt_events', { debt_id: it.id, date, amount, type: 'pagamento', month })
-    : api('POST', 'bill_payments', { bill_id: it.id, month, amount, paid_on: date });
+      : api('POST', 'debt_events', { debt_id: it.id, date, amount, type: 'pagamento', month: it.m || month })
+    : api('POST', 'bill_payments', { bill_id: it.id, month: it.m || month, amount, paid_on: date });
 
 const removePayment = (it) => api('DELETE', (it.kind === 'debt' ? 'debt_events/' : 'bill_payments/') + it.ref.id);
 
@@ -590,15 +598,23 @@ function viewMes() {
   const paid = sum(items.filter((i) => i.ref), (i) => i.amount);
   const incs = incomesFor(month);
   const income = sum(incs, (i) => i.amount);
+  // No mês atual, mostra também o que ficou por pagar nos meses anteriores (as de meses passados já pagas não entram).
+  const overdue = month === monthOf(cur) ? lateItems().filter((l) => l.m < month) : [];
   return `${monthBar()}
     ${calendarHtml(items, incs)}
     <div class="card">
       <div class="row"><span>Total do mês</span><b>${eur(total)}</b></div>
       <div class="row"><span>Pago</span><b class="good">${eur(paid)}</b></div>
       <div class="row"><span>Em falta</span><b class="warn">${eur(total - paid)}</b></div>
+      ${overdue.length ? `<div class="row"><span>Em atraso (meses anteriores)</span><b class="bad">${eur(sum(overdue, (l) => l.amount))}</b></div>` : ''}
       <div class="row"><span>Saldo (entradas − saídas)</span><b class="${income - total < 0 ? 'bad' : 'good'}">${eur(income - total)}</b></div>
     </div>
     ${splitCards(items, incs)}
+    ${overdue.length ? `<h2>Em atraso de meses anteriores</h2>${overdue.map((l) => `<div class="card item">
+        <button class="chk" data-act="toggle" data-kind="${l.kind}" data-id="${l.id}" data-m="${l.m}" aria-label="Marcar como pago"></button>
+        <div class="grow"><div class="name">${esc(l.name)}</div><div class="muted bad">venceu ${esc(l.due.slice(8))}/${esc(l.due.slice(5, 7))} · ${esc(sourceName(l.source_id))} · ${l.days} ${l.days === 1 ? 'dia' : 'dias'} de atraso</div></div>
+        <button class="btn sec sm" data-act="pay" data-kind="${l.kind}" data-id="${l.id}" data-m="${l.m}">${eur(l.amount)}</button>
+      </div>`).join('')}` : ''}
     <h2>Para pagar</h2>
     ${items.length ? items.map((it) => {
       const late = !it.ref && it.day && `${month}-${pad(it.day)}` < cur;
@@ -639,7 +655,7 @@ function viewContas() {
     <button class="btn fab" data-act="bill-new">+ Nova conta</button>
     ${bills.length ? `<div class="muted" style="margin-bottom:8px">Fixas por mês: ${eur(monthly)}</div>` : ''}
     ${bills.length ? bills.map((b) => `<div class="card row" data-act="bill-edit" data-id="${b.id}">
-      <span>${esc(b.name)}<div class="muted">${b.recurrence === 'mensal' ? 'todo dia ' + b.due_day : esc(b.due_date)} · ${esc(sourceName(b.source_id))}</div></span><b>${eur(b.amount)}</b></div>`).join('') : '<div class="empty">Ainda sem contas registadas.</div>'}`;
+      <span>${esc(b.name)}<div class="muted">${b.recurrence === 'mensal' ? 'todo dia ' + b.due_day + (hasStart(b) ? ' · desde ' + esc(shortMonth(b.start_month)) : '') : esc(b.due_date)} · ${esc(sourceName(b.source_id))}</div></span><b>${eur(b.amount)}</b></div>`).join('') : '<div class="empty">Ainda sem contas registadas.</div>'}`;
 }
 
 function viewConfig() {
@@ -866,7 +882,8 @@ document.addEventListener('click', (e) => {
   if (!el) return;
   const { act, id, kind } = el.dataset;
   if (el.closest('dialog')) dlg.close();
-  const item = () => monthItems(month).find((i) => i.kind === kind && i.id === Number(id));
+  // data-m: a conta pode ser de um mês anterior (secção "Em atraso" do mês atual).
+  const item = () => monthItems(el.dataset.m || month).find((i) => i.kind === kind && i.id === Number(id));
   switch (act) {
     case 'month': month = addMonths(month, Number(el.dataset.d)); return render();
     case 'toggle': {
