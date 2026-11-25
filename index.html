@@ -206,6 +206,35 @@ const sourceName = (id) => db.sources.find((s) => s.id === id)?.name || 'Sem con
 
 // Só considera o mês de início se vier no formato AAAA-MM (num browser sem seletor de mês é texto livre).
 const hasStart = (d) => /^\d{4}-\d{2}$/.test(d.start_month || '');
+// Dia em que o "mês" começa (ex.: 25 = o mês de dezembro vai de 25/11 a 24/12). 0 ou 1 = mês de calendário.
+const cycleDay = () => (db.cycle_day === undefined ? 25 : Number(db.cycle_day) || 0);
+const dayDate = (m, day) => {
+  const [y, mo] = m.split('-').map(Number);
+  return `${m}-${pad(Math.min(day, new Date(y, mo, 0).getDate()))}`;
+};
+// Início do período de cada mês: data própria (db.month_starts) ou, na falta dela, o dia padrão do mês anterior.
+const periodStart = (m) => {
+  const v = db.month_starts?.[m];
+  if (/^\d{4}-\d{2}-\d{2}$/.test(v || '')) return v;
+  return cycleDay() > 1 ? dayDate(addMonths(m, -1), cycleDay()) : m + '-01';
+};
+const periodEnd = (m) => periodStart(addMonths(m, 1)); // exclusivo
+const periodLast = (m) => {
+  const x = new Date(periodEnd(m) + 'T00:00:00');
+  x.setDate(x.getDate() - 1);
+  return localDate(x);
+};
+const dm = (d) => d.slice(8) + '/' + d.slice(5, 7);
+// Data de vencimento, dentro do período do mês m, de uma conta com dia fixo.
+const dueIn = (m, day) => {
+  const s = periodStart(m), e = periodEnd(m);
+  for (const cm of [monthOf(s), addMonths(monthOf(s), 1)]) {
+    const d = dayDate(cm, day);
+    if (d >= s && d < e) return d;
+  }
+  return dayDate(m, day);
+};
+const dueLabel =(it) => (it.due ? 'dia ' + Number(it.due.slice(8)) + (it.due.slice(0, 7) === it.m ? '' : '/' + it.due.slice(5, 7)) + ' · ' : '');
 const isYM = (v) => /^\d{4}-\d{2}$/.test(v || '');
 // Mês de referência de uma conta avulsa (pode diferir do mês da data de vencimento/pagamento).
 const billRef = (b) => (isYM(b.ref_month) ? b.ref_month : b.due_date ? monthOf(b.due_date) : null);
@@ -246,20 +275,23 @@ function monthItems(m) {
       if (m < d.start_month) continue;
       if (d.installments_total && m >= addMonths(d.start_month, d.installments_total)) continue;
     }
-    items.push({ kind: 'debt', id: d.id, m, name: 'Prestação · ' + d.name, amount: ref ? ref.amount : d.installment_amount, day: d.due_day, source_id: d.source_id, ref });
+    items.push({ kind: 'debt', id: d.id, m, name: 'Prestação · ' + d.name, amount: ref ? ref.amount : d.installment_amount, day: d.due_day, due: d.due_day ? dayDate(m, d.due_day) : null, source_id: d.source_id, ref });
   }
   for (const b of db.bills) {
     let day = b.due_day;
+    // Mensal: o vencimento é o dia que cai dentro do período do mês m (ex.: dia 29 → 29/11 para dezembro).
+    let due = day ? dueIn(m, day) : null;
     if (b.recurrence === 'avulsa') {
       if (!b.due_date || billRef(b) !== m) continue;
       day = Number(b.due_date.slice(8));
+      due = b.due_date;
     }
     const ref = db.bill_payments.find((p) => p.bill_id === b.id && p.month === m);
     // Conta mensal ainda não iniciada neste mês: não aparece (um pagamento já registado aparece sempre).
     if (!ref && b.recurrence !== 'avulsa' && hasStart(b) && m < b.start_month) continue;
-    items.push({ kind: 'bill', id: b.id, m, name: b.name, amount: ref ? ref.amount : b.amount, day, source_id: b.source_id, ref, noRef: billNoRef(b) });
+    items.push({ kind: 'bill', id: b.id, m, name: b.name, amount: ref ? ref.amount : b.amount, day, due, source_id: b.source_id, ref, noRef: billNoRef(b) });
   }
-  return items.sort((a, b) => (a.day || 99) - (b.day || 99));
+  return items.sort((a, b) => (a.due || '9').localeCompare(b.due || '9'));
 }
 
 // Linhas mês a mês para um conjunto de dívidas (opcionalmente com contas pagas e recebimentos).
@@ -519,7 +551,24 @@ const removePayment = (it) => api('DELETE', (it.kind === 'debt' ? 'debt_events/'
 
 // ---------- vistas ----------
 function monthBar() {
-  return `<div class="monthbar"><button data-act="month" data-d="-1">‹</button><h1>${esc(monthLabel(month))}</h1><button data-act="month" data-d="1">›</button></div>`;
+  const custom = /^\d{4}-\d{2}-\d{2}$/.test(db.month_starts?.[month] || '');
+  return `<div class="monthbar"><button data-act="month" data-d="-1">‹</button><h1>${esc(monthLabel(month))}</h1><button data-act="month" data-d="1">›</button></div>
+    <div class="muted" style="text-align:center;margin:-2px 0 10px">período ${dm(periodStart(month))} → ${dm(periodLast(month))}${custom ? '' : ' (padrão)'} <button class="star" data-act="period-edit" title="Alterar o início deste mês">✎</button></div>`;
+}
+
+function editPeriod() {
+  openForm({
+    title: 'Início de ' + monthLabel(month),
+    fields: [{ k: 'start', l: 'Primeiro dia deste mês (ex.: dia em que o dinheiro entrou). Vazio = padrão', t: 'date' }],
+    values: { start: db.month_starts?.[month] || periodStart(month) },
+    onSave: async (v) => {
+      const st = loadStore();
+      st.month_starts = { ...(st.month_starts || {}) };
+      if (v.start) st.month_starts[month] = v.start;
+      else delete st.month_starts[month];
+      localStorage.setItem(STORE, JSON.stringify(st));
+    },
+  });
 }
 
 function splitCards(items, incs) {
@@ -551,7 +600,7 @@ function viewResumo() {
     </div>
     ${incs.length ? `<h2>Entradas</h2>${incs.map((i) => `<div class="card row" data-act="inc-edit" data-id="${i.id}"><span>${esc(i.name)}<div class="muted">${esc(i.date.slice(8))}/${esc(i.date.slice(5, 7))} · ${esc(sourceName(i.source_id))}</div></span><b class="good">${eur(i.amount)}</b></div>`).join('')}` : ''}
     <button class="btn sec fab" data-act="inc-new">+ Registar entrada neste mês</button>
-    ${items.length ? `<h2>Saídas</h2>${items.map((it) => `<div class="card row ${it.ref ? 'muted' : ''}"><span>${it.ref ? '✓ ' : ''}${esc(it.name)}<div class="muted">${it.day ? 'dia ' + it.day + ' · ' : ''}${esc(sourceName(it.source_id))}</div></span><b>${eur(it.amount)}</b></div>`).join('')}` : ''}
+    ${items.length ? `<h2>Saídas</h2>${items.map((it) => `<div class="card row ${it.ref ? 'muted' : ''}"><span>${it.ref ? '✓ ' : ''}${esc(it.name)}<div class="muted">${dueLabel(it)}${esc(sourceName(it.source_id))}</div></span><b>${eur(it.amount)}</b></div>`).join('')}` : ''}
     ${splitCards(items, incs)}
     <h2>Dívidas</h2>
     <div class="card">
@@ -572,7 +621,7 @@ function calendarHtml(items, incs) {
   let cells = ['Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb', 'Dom'].map((d) => `<div class="dow">${d}</div>`).join('') + '<i></i>'.repeat(lead);
   for (let d = 1; d <= days; d++) {
     const date = `${month}-${pad(d)}`;
-    const out = items.filter((i) => i.day === d);
+    const out = items.filter((i) => i.due === date);
     const dots = [
       incs.some((i) => i.date === date) ? '<s class="dot g"></s>' : '',
       out.some((i) => !i.ref) ? '<s class="dot r"></s>' : '',
@@ -585,7 +634,7 @@ function calendarHtml(items, incs) {
 }
 
 function openDay(date) {
-  const items = monthItems(month).filter((i) => i.day && `${month}-${pad(i.day)}` === date);
+  const items = monthItems(month).filter((i) => i.due === date);
   const incs = incomesFor(month).filter((i) => i.date === date);
   const [y, mo, d] = date.split('-').map(Number);
   const label = new Intl.DateTimeFormat('pt-PT', { weekday: 'long', day: 'numeric', month: 'long' }).format(new Date(y, mo - 1, d));
@@ -633,10 +682,10 @@ function viewMes() {
       </div>`).join('')}` : ''}
     <h2>Para pagar</h2>
     ${items.length ? items.map((it) => {
-      const late = !it.ref && it.day && `${month}-${pad(it.day)}` < cur;
+      const late = !it.ref && it.due && it.due < cur;
       return `<div class="card item ${it.ref ? 'paid' : ''}">
         <button class="chk ${it.ref ? 'on' : ''}" data-act="toggle" data-kind="${it.kind}" data-id="${it.id}" aria-label="Marcar como pago">${it.ref ? '✓' : ''}</button>
-        <div class="grow"><div class="name">${esc(it.name)}${it.noRef && it.kind === 'bill' ? `<button class="star" data-act="bill-edit" data-id="${it.id}" aria-label="Definir mês de referência" title="Sem mês de referência — toque para definir">*</button>` : ''}</div><div class="muted ${late ? 'bad' : ''}">${it.day ? 'dia ' + it.day + ' · ' : ''}${esc(sourceName(it.source_id))}${late ? ' · atrasada' : ''}</div></div>
+        <div class="grow"><div class="name">${esc(it.name)}${it.noRef && it.kind === 'bill' ? `<button class="star" data-act="bill-edit" data-id="${it.id}" aria-label="Definir mês de referência" title="Sem mês de referência — toque para definir">*</button>` : ''}</div><div class="muted ${late ? 'bad' : ''}">${dueLabel(it)}${esc(sourceName(it.source_id))}${late ? ' · atrasada' : ''}</div></div>
         <button class="btn sec sm" data-act="pay" data-kind="${it.kind}" data-id="${it.id}">${eur(it.amount)}</button>
       </div>`;
     }).join('') : '<div class="empty">Nada para este mês.</div>'}`;
@@ -701,6 +750,9 @@ function viewConfig() {
     <button class="btn fab" data-act="type-new">+ Novo tipo de entrada</button>
     ${db.income_types.map((t) => `<div class="card row" data-act="type-edit" data-id="${t.id}"><span>${esc(t.name)}<div class="muted">${esc(sourceName(t.source_id))}</div></span><b>${t.amount ? eur(t.amount) : ''}</b></div>`).join('')}
     <div class="muted">As entradas de cada mês registam-se em Mês (toque no dia) ou no Resumo.</div>
+    <h2>Início do mês</h2>
+    <label>Dia padrão em que o mês começa (25 = dezembro vai de 25/11 a 24/12; 1 = mês de calendário). Em Mês, o ✎ ajusta o início de um mês específico.<input id="cycleDay" type="number" min="1" max="28" inputmode="numeric" value="${cycleDay() || 1}"></label>
+    <div class="muted">Cada conta mensal conta para o mês cujo período contém o seu dia de vencimento.</div>
     <h2>Cópia de segurança</h2>
     <div class="muted">Última cópia: ${esc(localStorage.getItem('contas_last_export') || 'nunca')}</div>
     <button class="btn fab" data-act="export">Guardar cópia de segurança</button>
@@ -772,12 +824,11 @@ function lateItems() {
   const today = localDate();
   const cur = monthOf(today);
   const out = [];
-  for (const k of [2, 1, 0]) {
+  for (const k of [2, 1, 0, -1]) {
     const m = addMonths(cur, -k);
-    const [y, mo] = m.split('-').map(Number);
     for (const it of monthItems(m)) {
-      if (it.ref || !it.day) continue;
-      const due = `${m}-${pad(Math.min(it.day, new Date(y, mo, 0).getDate()))}`;
+      if (it.ref || !it.due) continue;
+      const due = it.due;
       if (due >= today) continue;
       out.push({ ...it, m, due, days: Math.round((new Date(today) - new Date(due)) / 864e5) });
     }
@@ -932,6 +983,7 @@ document.addEventListener('click', (e) => {
     case 'debt-add': return debtMovement(find(db.debts, id), 'acrescimo');
     case 'ev-del': return confirm('Excluir este movimento?') && run(() => api('DELETE', 'debt_events/' + id));
     case 'bill-new': return editBill(null, el.dataset.date);
+    case 'period-edit': return editPeriod();
     case 'bill-filter': billFilter = el.dataset.v; return render();
     case 'day': return openDay(el.dataset.date);
     case 'late-pay': month = el.dataset.m; return editPayment(item());
@@ -981,6 +1033,13 @@ document.addEventListener('change', async (e) => {
   if (e.target.id === 'repSel') {
     repSel = e.target.value;
     return render();
+  }
+  if (e.target.id === 'cycleDay') {
+    const n = Math.min(28, Math.max(1, Math.round(Number(e.target.value)) || 1));
+    const st = loadStore();
+    st.cycle_day = n;
+    localStorage.setItem(STORE, JSON.stringify(st));
+    return reload();
   }
   if (e.target.id !== 'imp' || !e.target.files[0]) return;
   try {
