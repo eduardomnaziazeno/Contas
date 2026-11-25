@@ -280,7 +280,7 @@ function monthItems(m) {
       if (m < d.start_month) continue;
       if (d.installments_total && m >= addMonths(d.start_month, d.installments_total)) continue;
     }
-    items.push({ kind: 'debt', id: d.id, m, name: 'Prestação · ' + d.name, amount: ref ? ref.amount : d.installment_amount, day: d.due_day, due: d.due_day ? dayDate(m, d.due_day) : null, source_id: d.source_id, ref });
+    items.push({ kind: 'debt', id: d.id, m, name: 'Prestação · ' + d.name, amount: ref ? ref.amount : d.installment_amount, day: d.due_day, due: d.due_day ? dueIn(m, d.due_day) : null, source_id: d.source_id, ref });
   }
   for (const b of db.bills) {
     let day = b.due_day;
