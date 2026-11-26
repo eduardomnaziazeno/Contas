@@ -74,6 +74,7 @@ nav button.on { color: var(--accent); background: color-mix(in srgb, var(--accen
 .item.paid .name { text-decoration: line-through; color: var(--muted); }
 .star { background: none; border: 0; padding: 0 4px; color: var(--warn); font-weight: 700; font-size: 16px; }
 .tag { display: inline-block; margin-left: 6px; padding: 1px 7px; border-radius: 8px; font-size: 11px; font-weight: 600; vertical-align: 1px; background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); text-decoration: none; }
+.lnk { background: none; border: 0; padding: 0 0 0 4px; color: var(--accent); font-size: 13px; }
 .chips { display: flex; gap: 8px; margin: 4px 0 12px; flex-wrap: wrap; }
 .chips .btn.on { background: var(--accent); color: #fff; border-color: var(--accent); }
 .monthbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
@@ -277,11 +278,14 @@ function monthItems(m) {
     if (!ref && debtStats(d).balance <= 0) continue;
     // Janela de cobrança: do mês da 1.ª prestação até à última (se o nº de prestações for conhecido).
     // Um pagamento já registado nesse mês aparece sempre, mesmo fora da janela.
+    // O mês de início conta pela DATA de vencimento (não pelo mês de referência): a prestação de 26/11 é a de novembro.
+    const due = d.due_day ? dueIn(m, d.due_day) : null;
+    const dueM = due ? monthOf(due) : m;
     if (!ref && hasStart(d)) {
-      if (m < d.start_month) continue;
-      if (d.installments_total && m >= addMonths(d.start_month, d.installments_total)) continue;
+      if (dueM < d.start_month) continue;
+      if (d.installments_total && dueM >= addMonths(d.start_month, d.installments_total)) continue;
     }
-    items.push({ kind: 'debt', id: d.id, m, name: 'Prestação · ' + d.name, amount: ref ? ref.amount : d.installment_amount, day: d.due_day, due: d.due_day ? dueIn(m, d.due_day) : null, source_id: d.source_id, ref, extra: !!d.extra });
+    items.push({ kind: 'debt', id: d.id, m, name: 'Prestação · ' + d.name, amount: ref ? ref.amount : d.installment_amount, day: d.due_day, due, source_id: d.source_id, ref, extra: !!d.extra });
   }
   for (const b of db.bills) {
     let day = b.due_day;
@@ -295,7 +299,7 @@ function monthItems(m) {
     // Avulsa ocorre uma só vez: o pagamento vale seja qual for o mês em que foi gravado.
     const ref = db.bill_payments.find((p) => p.bill_id === b.id && (b.recurrence === 'avulsa' || p.month === m));
     // Conta mensal ainda não iniciada neste mês: não aparece (um pagamento já registado aparece sempre).
-    if (!ref && b.recurrence !== 'avulsa' && hasStart(b) && m < b.start_month) continue;
+    if (!ref && b.recurrence !== 'avulsa' && hasStart(b) && (due ? monthOf(due) : m) < b.start_month) continue;
     items.push({ kind: 'bill', id: b.id, m, name: b.name, amount: ref ? ref.amount : b.amount, day, due, source_id: b.source_id, ref, extra: !!b.extra });
   }
   return items.sort((a, b) => (a.due || '9').localeCompare(b.due || '9'));
@@ -665,6 +669,7 @@ function viewMes() {
   const items = monthItems(month);
   const cur = localDate();
   const total = sum(items, (i) => i.amount);
+  const extras = items.filter((i) => i.extra);
   const paid = sum(items.filter((i) => i.ref), (i) => i.amount);
   const incs = incomesFor(month);
   const income = sum(incs, (i) => i.amount);
@@ -676,14 +681,14 @@ function viewMes() {
       <div class="row"><span>Total do mês</span><b>${eur(total)}</b></div>
       <div class="row"><span>Pago</span><b class="good">${eur(paid)}</b></div>
       <div class="row"><span>Em falta</span><b class="warn">${eur(total - paid)}</b></div>
-      ${items.some((i) => i.extra) ? `<div class="row"><span>Extras do mês (fora do habitual)</span><b class="warn">${eur(sum(items.filter((i) => i.extra), (i) => i.amount))}</b></div><div class="row muted"><span>Habitual</span><span>${eur(total - sum(items.filter((i) => i.extra), (i) => i.amount))}</span></div>` : ''}
+      ${extras.length ? `<div class="row"><span>Extras (${extras.length}) · já pagos ${eur(sum(extras.filter((i) => i.ref), (i) => i.amount))}</span><b class="warn">${eur(sum(extras, (i) => i.amount))}</b></div><div class="row muted"><span>Habitual (sem extras)</span><span>${eur(total - sum(extras, (i) => i.amount))}</span></div>` : ''}
       ${overdue.length ? `<div class="row"><span>Em atraso (meses anteriores)</span><b class="bad">${eur(sum(overdue, (l) => l.amount))}</b></div>` : ''}
       <div class="row"><span>Saldo (entradas − saídas)</span><b class="${income - total < 0 ? 'bad' : 'good'}">${eur(income - total)}</b></div>
     </div>
     ${splitCards(items, incs)}
     ${overdue.length ? `<h2>Em atraso de meses anteriores</h2>${overdue.map((l) => `<div class="card item">
         <button class="chk" data-act="toggle" data-kind="${l.kind}" data-id="${l.id}" data-m="${l.m}" aria-label="Marcar como pago"></button>
-        <div class="grow"><div class="name">${esc(l.name)}</div><div class="muted bad">venceu ${esc(l.due.slice(8))}/${esc(l.due.slice(5, 7))} · ${esc(sourceName(l.source_id))} · ${l.days} ${l.days === 1 ? 'dia' : 'dias'} de atraso</div></div>
+        <div class="grow"><div class="name">${esc(l.name)}${l.extra ? '<span class="tag">extra</span>' : ''}</div><div class="muted bad">venceu ${esc(l.due.slice(8))}/${esc(l.due.slice(5, 7))} · ${esc(sourceName(l.source_id))} · ${l.days} ${l.days === 1 ? 'dia' : 'dias'} de atraso</div></div>
         <button class="btn sec sm" data-act="pay" data-kind="${l.kind}" data-id="${l.id}" data-m="${l.m}">${eur(l.amount)}</button>
       </div>`).join('')}` : ''}
     <h2>Para pagar</h2>
@@ -691,7 +696,7 @@ function viewMes() {
       const late = !it.ref && it.due && it.due < cur;
       return `<div class="card item ${it.ref ? 'paid' : ''}">
         <button class="chk ${it.ref ? 'on' : ''}" data-act="toggle" data-kind="${it.kind}" data-id="${it.id}" aria-label="Marcar como pago">${it.ref ? '✓' : ''}</button>
-        <div class="grow"><div class="name">${esc(it.name)}${it.extra ? '<span class="tag">extra</span>' : ''}</div><div class="muted ${late ? 'bad' : ''}">${dueLabel(it)}${esc(sourceName(it.source_id))}${late ? ' · atrasada' : ''}</div></div>
+        <div class="grow"><div class="name">${esc(it.name)}${it.extra ? '<span class="tag">extra</span>' : ''}</div><div class="muted ${late ? 'bad' : ''}">${dueLabel(it)}${esc(sourceName(it.source_id))}${late ? ' · atrasada' : ''} · <button class="lnk" data-act="extra-toggle" data-kind="${it.kind}" data-id="${it.id}">${it.extra ? 'tirar extra' : '+extra'}</button></div></div>
         <button class="btn sec sm" data-act="pay" data-kind="${it.kind}" data-id="${it.id}">${eur(it.amount)}</button>
       </div>`;
     }).join('') : '<div class="empty">Nada para este mês.</div>'}`;
@@ -742,7 +747,7 @@ function viewContas() {
     ${shown.length ? shown.map(({ b, m, it, paid }) => `<div class="card item ${paid ? 'paid' : ''}" data-act="bill-edit" data-id="${b.id}">
       ${it ? `<button class="chk ${paid ? 'on' : ''}" data-act="toggle" data-kind="bill" data-id="${b.id}" data-m="${m}" aria-label="Marcar como pago">${paid ? '✓' : ''}</button>` : ''}
       <div class="grow"><div class="name">${esc(b.name)}${b.extra ? '<span class="tag">extra</span>' : ''}</div>
-      <div class="muted">${b.recurrence === 'mensal' ? 'todo dia ' + b.due_day + (hasStart(b) ? ' · desde ' + esc(shortMonth(b.start_month)) : '') : esc(b.due_date) + (m ? ' · ' + esc(shortMonth(m)) : '')} · ${esc(sourceName(b.source_id))}</div></div>
+      <div class="muted">${b.recurrence === 'mensal' ? 'todo dia ' + b.due_day + (hasStart(b) ? ' · desde ' + esc(shortMonth(b.start_month)) : '') : esc(b.due_date) + (m ? ' · ' + esc(shortMonth(m)) : '')} · ${esc(sourceName(b.source_id))} · <button class="lnk" data-act="extra-toggle" data-kind="bill" data-id="${b.id}">${b.extra ? 'tirar extra' : '+extra'}</button></div></div>
       <b>${eur(b.amount)}</b></div>`).join('') : `<div class="empty">${base.length ? 'Nada nesta lista.' : 'Ainda sem contas registadas.'}</div>`}`;
 }
 
@@ -989,6 +994,11 @@ document.addEventListener('click', (e) => {
     case 'ev-del': return confirm('Excluir este movimento?') && run(() => api('DELETE', 'debt_events/' + id));
     case 'bill-new': return editBill(null, el.dataset.date);
     case 'period-edit': return editPeriod();
+    case 'extra-toggle': {
+      const tbl = kind === 'debt' ? 'debts' : 'bills';
+      const row = find(db[tbl], id);
+      return run(() => api('PUT', tbl + '/' + id, { extra: !row.extra }));
+    }
     case 'bill-filter': billFilter = el.dataset.v; return render();
     case 'day': return openDay(el.dataset.date);
     case 'late-pay': month = el.dataset.m; return editPayment(item());
