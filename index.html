@@ -281,7 +281,7 @@ function monthItems(m) {
       if (m < d.start_month) continue;
       if (d.installments_total && m >= addMonths(d.start_month, d.installments_total)) continue;
     }
-    items.push({ kind: 'debt', id: d.id, m, name: 'Prestação · ' + d.name, amount: ref ? ref.amount : d.installment_amount, day: d.due_day, due: d.due_day ? dueIn(m, d.due_day) : null, source_id: d.source_id, ref });
+    items.push({ kind: 'debt', id: d.id, m, name: 'Prestação · ' + d.name, amount: ref ? ref.amount : d.installment_amount, day: d.due_day, due: d.due_day ? dueIn(m, d.due_day) : null, source_id: d.source_id, ref, extra: !!d.extra });
   }
   for (const b of db.bills) {
     let day = b.due_day;
@@ -479,10 +479,14 @@ function editDebt(d) {
       { k: 'start_month', l: 'Primeira prestação cobrada em (mês, AAAA-MM)', t: 'month' },
       num('due_day', 'Dia do vencimento'),
       { k: 'source_id', l: 'Debitada de', t: 'select', opts: sourceOpts() },
+      { k: 'extra', l: 'Prestação extra (fora do habitual do mês)?', t: 'select', opts: [['', 'Não'], ['1', 'Sim, é extra']] },
       { k: 'notes', l: 'Notas' },
     ],
-    values: d,
-    onSave: (v) => (d ? api('PUT', 'debts/' + d.id, v) : api('POST', 'debts', v)),
+    values: d && { ...d, extra: d.extra ? '1' : '' },
+    onSave: (v) => {
+      v.extra = !!v.extra;
+      return d ? api('PUT', 'debts/' + d.id, v) : api('POST', 'debts', v);
+    },
     onDelete: d && (() => api('DELETE', 'debts/' + d.id)),
   });
 }
@@ -701,7 +705,7 @@ function viewDividas() {
       const { d } = s;
       const pct = s.owed > 0 ? Math.min(100, Math.round((s.paid / s.owed) * 100)) : 0;
       return `<div class="card">
-        <div class="row"><b>${esc(d.name)}</b><b class="${s.balance > 0 ? 'bad' : 'good'}">${s.balance > 0 ? eur(s.balance) : 'Quitada'}</b></div>
+        <div class="row"><b>${esc(d.name)}${d.extra ? '<span class="tag">extra</span>' : ''}</b><b class="${s.balance > 0 ? 'bad' : 'good'}">${s.balance > 0 ? eur(s.balance) : 'Quitada'}</b></div>
         <div class="muted">${esc([KINDS[d.kind], d.creditor, d.installment_amount ? 'prestação ' + eur(d.installment_amount) : '', d.due_day ? 'dia ' + d.due_day : '', d.source_id ? sourceName(d.source_id) : ''].filter(Boolean).join(' · '))}</div>
         <div class="bar"><i style="width:${pct}%"></i></div>
         <div class="muted">Pago ${eur(s.paid)} de ${eur(s.owed)} (${pct}%)${s.remaining ? ` · faltam ${s.remaining} prestações até ${esc(shortMonth(s.endMonth))}` : ''}</div>
